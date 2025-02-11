@@ -1,0 +1,718 @@
+---
+title: "Measuring the Return of Football Player Investment on Team Performance"
+author: "Candidate Number: 37942"
+date: "January 15 2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+**Prompt:** 2
+
+**ChatGPT/AI disclosure statement:** I utilized ChatGPT to check spelling and assist in creating vectors for merging my data. This was particularly important because team names were inconsistently formatted and appeared in different languages across my sources. To standardize them, I assigned a unique ID to each team, and ChatGPT streamlined the process by efficiently aiding in the assignment of these IDs.
+
+### 1. Research scope and rationale
+
+Football clubs invest heavily in player transfers to strengthen their teams, making it essential to understand how these investments relate to team performance.
+
+This report compiles two key data sources for future analysis. First, I gather player transaction data from **transfermarkt.com** for the 36 clubs in the UEFA Champions League since 1997, providing details on transfer spending and financial strategies. Second, I collect team performance data from **clubelo.com**, which uses ELO ratings to measure team strength based on match results.
+
+By presenting these datasets, this report sets the foundation for understanding the connection between financial investments on players and team performance in elite European football.
+
+
+### 2. Web scraping transaction data
+
+**Transfermarkt** is a leading platform for football transaction data, offering crucial information about player stats, market values, and club transfers It serves as a primary resource for analyzing trends in the football transfer market.
+
+Here is an example of how transfer data is presented on the platform, showcasing Manchester City's "altas" (purchases) and "bajas" (sales) for the current season.
+
+![](inputs/transfermarkt.png)
+
+To retrieve the transaction history of every Champions League team, I followed next steps:
+
+#### 2.1 Extract the names and unique IDs of all 36 teams from the Champions League page on Transfermarkt
+
+```{r}
+
+# Setup 
+
+current_directory <- getwd()
+inputs <- file.path(current_directory, "inputs")
+outputs <- file.path(current_directory, "outputs")
+
+if (!dir.exists(inputs)) {
+  dir.create(inputs)}
+if (!dir.exists(outputs)) {
+  dir.create(outputs)}
+
+images <- file.path(inputs, "images")
+if (!dir.exists(images)) {
+  dir.create(images)}
+
+packages_needed <- c("rvest", "tidyverse", "httr", "kableExtra", "ggplot2", "ggimage", "readr")
+
+for (package in packages_needed) {
+  if (!requireNamespace(package, quietly = TRUE)) {
+    install.packages(package)
+  }
+}
+
+```
+
+```{r}
+
+library(rvest)
+library(tidyverse)
+library(httr)
+library(kableExtra)
+library(ggplot2)
+library(readr)
+
+
+url <- "https://www.transfermarkt.es/uefa-champions-league/teilnehmer/pokalwettbewerb/CL/saison_id/2024"
+page <- read_html(url)
+href_links <- page %>%
+  html_nodes("a") %>%
+  html_attr("href")
+
+#Filter just the club-page links
+team_data <- unique(grep("verein", href_links, value = TRUE))
+
+# Separate names and ids
+team_names <- gsub("/(.*)/startseite/verein/[0-9]+", "\\1", team_data)
+team_ids <- as.double(gsub(".*/verein/([0-9]+)", "\\1", team_data))
+
+# Create a data frame with team info 
+team_info <- data.frame(
+  name = team_names,
+  id = team_ids,
+  stringsAsFactors = FALSE
+)
+
+```
+
+#### 2.2 Construct the URL of the transaction data for each team and clean the team names for better readability
+
+```{r}
+
+team_info$team_transfer_link <- paste0("https://www.transfermarkt.es/", team_info$name,
+                                       "/alletransfers/verein/", team_info$id)
+
+# Replace the transfer-market names with the real names of the teams for better legibility 
+team_info <- team_info %>%
+  mutate(
+    name = str_replace_all(name, "-", " "),
+    name = str_to_title(name),
+    name = str_replace_all(name, "\\bFc\\b", "FC") # FC means Football Club and it needs to be in uppercase
+  )
+
+```
+
+#### 2.3 Set up parameters to automate the search process
+
+```{r}
+
+current_season <- as.numeric(format(Sys.Date(), "%Y")) - 1 # Set the current season 
+first_season <- 1997 # The starting season from which data will be retrieved
+number_tables <- (current_season - first_season) * 2  #Each year has a sales and a purchases table 
+
+# Create labels for each season
+seasons <- vector("character", length = current_season - first_season + 1)
+for (year in first_season:current_season) {
+  seasons[year - first_season + 1] <- paste0(year,"/", year + 1)
+}
+
+```
+
+#### 2.4 Function to extract and clean data, focusing on the total money spent on player purchases and earned through sales
+
+```{r}
+
+process_team_url <- function(team_url, team_name, team_ids, number_tables, seasons) {
+
+  Sys.sleep(runif(1, min = 1, max = 5)) # Wait to make a new request 
+  
+  page <- read_html(team_url)
+  tables <- html_table(page)
+  
+  # Limit the tables to the number of seasons
+  tables <- tables[1:min(length(tables), number_tables)]
+  values <- character(length = length(tables))
+  
+  # Extract the last value of each table (sales/purchases)
+  for (i in seq_along(tables)) {
+    table <- tables[[i]]
+    
+    # Check if the table has data
+    if (nrow(table) > 0 && ncol(table) > 0) {
+      value <- as.character(table[nrow(table), ncol(table)])
+    } else {
+      value <- NA  # If the table is empty, set as NA
+    }
+    values[i] <- value
+  }
+  
+  # Clean the extracted values
+  clean_values <- gsub(",", ".", values) 
+  clean_values <- gsub(" mil €", "", clean_values)
+  clean_values <- gsub(" mill\\. €", "", clean_values) 
+  clean_values <- gsub(" €", "", clean_values) 
+  numeric_values <- as.numeric(clean_values)
+  
+  # Adjust values to millions of euros
+  numeric_values[grepl("mil ", values)] <- numeric_values[grepl("mil ", values)] / 1000
+  numeric_values[!grepl("mil ", values) & !grepl("mill.", values)] <- 
+    numeric_values[!grepl("mil ", values) & !grepl("mill.", values)] / 1000000
+  
+  
+  # Separate into purchases, sales, and balance
+  purchases <- numeric_values[seq(1, length(numeric_values), by = 2)]  # Odd indices
+  sales <- numeric_values[seq(2, length(numeric_values), by = 2)]  # Even indices
+  balance <- sales - purchases
+  
+  # Create a data frame with the information 
+team_transaction <- data.frame(
+    Team = team_name,
+    ID = team_ids,
+    Season = rev(seasons)[1:length(purchases)], 
+    Purchases = purchases,
+    Sales = sales,
+    Balance = balance
+  )
+  return(team_transaction)
+}
+
+```
+
+#### 2.5 Iterate to extract information for all 36 teams   
+
+```{r, eval = FALSE}
+
+ # This  code chunk is currently set to eval = FALSE. To start scraping, change it to eval = TRUE
+
+ #Only execute the scraping process if it is necessary
+
+if (!file.exists("outputs/all_teams_transaction.csv")) { 
+        
+        all_teams_transaction <- vector("list", length = length(team_info$team_transfer_link) * number_tables)
+        
+        # Loop through team information to process URLs and store results 
+        for (i in seq_along(team_info$team_transfer_link)) {
+          all_teams_transaction[[i]] <- process_team_url(
+            team_url = team_info$team_transfer_link[i],
+            team_name = team_info$name[i],
+            team_ids = team_info$id[i],
+            number_tables = number_tables,
+            seasons = seasons
+          )
+        }
+        
+        # Combine all data frames from the list into one
+        all_teams_transaction <- dplyr::bind_rows(all_teams_transaction)
+        
+        #Store the output as csv
+        write.csv(all_teams_transaction, "outputs/all_teams_transaction.csv", row.names = FALSE)
+        write.table(all_teams_transaction, "outputs/all_teams_transaction.txt", sep = "\t",
+                    row.names = FALSE, quote = FALSE, fileEncoding = "UTF-8")
+
+}
+```
+
+The following table presents team transaction data, where each row represents a team's financial activity during a specific season. The columns include the team's name, an ID number, the season, total expenditures on player purchases, total revenue from player sales, and the resulting balance. All monetary values are in millions of euros.
+
+```{r}
+
+all_teams_transaction <- read.csv("outputs/all_teams_transaction.csv")
+kable(head(all_teams_transaction), caption = "Table 1: First observations of team transaction data")
+
+```
+
+### 3. Team Performance via ELO Ratings
+
+ELO ratings measure team performance by accounting for match results, opponent strength, and game significance. This dynamic system captures changes in team strength over time, influenced by transfers and management.
+
+Used widely in research, ELO allows cross-league and cross-era comparisons. The **clubelo.com** API offers access to historical ELO ratings, enabling analysis of performance trends linked to financial investments.
+
+#### 3.1 Retrieve the URL required to query data for each Champions League team from the API
+
+```{r}
+
+url <- "http://clubelo.com/UCL"
+page <- read_html(url)
+href_links_elo <- page %>%
+  html_nodes("a") %>%
+  html_attr("href")
+
+#Filter only the champions league teams 
+start_index <- grep("^/UCL$", href_links_elo)
+end_index <- grep("^/UEL$", href_links_elo)
+filtered_links <- href_links_elo[(start_index + 1):(end_index - 1)]
+
+base_url <- "http://api.clubelo.com" 
+urls <- paste0(base_url, filtered_links)
+
+```
+
+#### 3.2 Set the parameters to initiate the searches
+
+```{r}
+
+start <- as.Date("1997-08-01") # Each european football season starts in August
+end <- as.Date("2024-12-31") 
+all_clubs_data <- list()
+
+```
+
+#### 3.3 Iterate through each URL to retrieve the ELO data
+
+```{r, eval = FALSE}
+
+# This code chunk is currently set to eval = FALSE. To start scraping, change it to eval = TRUE 
+# Only execute the scraping process if it is necessary
+
+if (!file.exists("outputs/all_teams_elo.csv")) {
+
+    for (i in seq_along(urls)) {
+      
+      Sys.sleep(runif(1, min = 1, max = 4)) # Wait to make a new request 
+      
+      # Read data for each club
+      club_data <- read_csv(urls[i], show_col_types = FALSE)
+      
+      # Filter data by date range
+      club_filtered <- club_data %>%
+        filter(From >= start & To <= end)
+      
+      # Add the club name to the dataset
+      club_name <- sub("^/", "", filtered_links[i])
+      club_filtered$Club <- club_name
+      
+      # Append the filtered data to the list
+      all_clubs_data[[i]] <- club_filtered
+    }
+    
+    # Combine all data frames at once
+    all_teams_elo <- bind_rows(all_clubs_data)
+    
+    rm(club_data, club_filtered, all_clubs_data)
+    
+    #Store the output as csv
+    write.csv(all_teams_elo, "outputs/all_teams_elo.csv", row.names = FALSE)
+    write.table(all_teams_elo, "outputs/all_teams_elo.txt", sep = "\t", row.names = FALSE, quote = FALSE, fileEncoding = "UTF-8")
+
+  }
+
+```
+
+The following table displays the team ELO data, where each row corresponds to an update after a specific match. Columns include the team's rank, name, country, league level, ELO rating, and the start and end dates for the given ELO score period.
+
+```{r}
+all_teams_elo <- read.csv("outputs/all_teams_elo.csv")
+kable(head(all_teams_elo), caption = "Table 2: First observations of team ELO data")
+```
+
+
+### 4. Data Processing and Transformation
+
+To prepare the retrieved data for analysis, the following five transformations were required:
+
+#### 4.1 Get the season average ELO for each team
+
+```{r}
+
+# Convert From and To to Date type
+all_teams_elo$From <- as.Date(all_teams_elo$From)
+all_teams_elo$To <- as.Date(all_teams_elo$To)
+
+# Calculate the average Elo per season
+average_season_elo <- all_teams_elo %>%
+  mutate(
+  Season = ifelse(
+  as.numeric(format(To, "%m")) >= 8,  # If the "To" month is August or later
+  paste0(format(To, "%Y"), "/", as.numeric(format(To, "%Y")) + 1),  # Season ends in current year and starts in previous year
+  paste0(as.numeric(format(To, "%Y")) - 1, "/", format(To, "%Y"))  # If before August, season ends in current year but starts previous year
+    )
+  ) %>%
+  group_by(Club, Season, Country) %>%
+  summarise(avg_elo = mean(Elo, na.rm = TRUE), .groups = "drop")
+
+```
+
+#### 4.2 Merge the transaction and performance data 
+
+Since the team names in the transaction and performance datasets do not exactly match, I provided ChatGPT with the unique team names from both datasets and asked it to generate the corresponding IDs for the ELO dataset. 
+
+###### The following lines of code were generated by AI/ChatGPT 
+
+```{r}
+
+ids <- c("Arsenal" = 11, "AstonVilla" = 405, "Atalanta" = 800, "Atletico" = 13, "Barcelona" = 131,
+         "Bayern" = 27, "Benfica" = 294, "Bologna" = 1025, "Brest" = 3911, "Brugge" = 2282, "Celtic" = 371,
+         "CrvenaZvezda" = 159, "DinamoZagreb" = 419, "Dortmund" = 16, "Feyenoord" = 234, "Girona" = 12321,
+         "Inter" = 46, "Juventus" = 506, "Leverkusen" = 15, "Lille" = 1082, "Liverpool" = 31,  "ManCity" = 281,
+         "Milan" = 1, "Monaco" = 162, "PSV" = 383, "ParisSG" = 583, "RBLeipzig" = 23826, "RealMadrid" = 418,
+         "Salzburg" = 409, "Shakhtar" = 660, "SlovanBratislava" = 540, "SpartaPraha" = 197, "Sporting" = 336,
+         "SturmGraz" = 122, "Stuttgart" = 79, "YoungBoys" = 452)
+```
+
+With the ID vector, we can now merge the transaction and performance data:
+
+```{r}
+
+average_season_elo <- average_season_elo %>%
+  mutate(ID = ids[Club])
+
+teams_table <- all_teams_transaction %>%
+  left_join(average_season_elo, by = c("ID", "Season")) %>%
+  select(-Club) %>%   # Drop the 'Club' variable since it is the same as the 'Team' one 
+  drop_na()   
+
+```
+
+
+#### 4.3 Calculate the annual change in ELO
+
+```{r}
+
+teams_table <- teams_table %>%
+  mutate(year = as.numeric(substr(Season, 1, 4))) %>%  # Extract the first 4 digits and convert to get the year
+  arrange(Team, year) %>%  
+  group_by(Team) %>%
+  mutate(elo_change = round(avg_elo - lag(avg_elo),2)) %>%  # Calculate the difference in ELO
+  ungroup()%>%
+  drop_na(elo_change)
+
+```
+
+#### 4.4 Calculate cumulative transaction data and logarithm of the total amount of money spent on purchases 
+
+```{r}
+
+teams_table <- teams_table %>%
+  group_by(Team) %>%
+  arrange(year) %>%
+  mutate(
+    total_purchases = cumsum(Purchases),
+    total_sales = cumsum(Sales),
+    total_balance = cumsum(Balance)
+  ) %>%
+  select(-Season) %>% #Since we have the year variable, we no longer need it 
+  ungroup()  %>%
+  mutate(log_purchases = ifelse(Sales == 0, NA, round(log(Sales * 1e6), 2)))
+
+kable(head(teams_table), caption = "Table 3: Merged data after transformations")
+
+write.csv(teams_table, "outputs/teams_table.csv", row.names = FALSE)
+write.table(teams_table, "outputs/teams_table.txt", sep = "\t", row.names = FALSE, quote = FALSE, fileEncoding = "UTF-8")
+
+```
+
+#### 4.5 The team logos were scraped, downloaded, and the path to each logo was then added to the Elo dataset for visualization purposes
+
+```{r}
+
+page_url <- "https://www.uefa.com/uefachampionsleague/clubs/"
+html_content <- read_html(page_url)
+group_sections <- html_content %>%
+  html_nodes(".teams-overview_group")
+
+# Filter the section that corresponds to the "League phase"
+league_phase_group <- group_sections %>%
+  .[html_nodes(., "h2") %>% html_text(trim = TRUE) == "League phase"]
+
+# Extract team names and logo URLs
+team_badges <- league_phase_group %>%
+  html_nodes(".team-wrap") %>%
+  lapply(function(item) {
+    list(
+      team_name = item %>% html_node("span[slot='primary']") %>% html_text(trim = TRUE),
+      logo_url = item %>% html_node("pk-badge") %>% html_attr("src")
+    )
+  }) %>%
+  do.call(rbind.data.frame, .)
+
+# Remove duplicate teams based on their names
+team_badges <- team_badges %>%
+  distinct(team_name, .keep_all = TRUE)
+colnames(team_badges) <- c("Team_Name", "Logo_URL")
+
+```
+
+I asked ChatGPT to give me the IDs of the badges dataset based on the transactions dataset. 
+
+###### The following lines of code were generated by AI/ChatGPT 
+
+```{r}
+
+team_ids <- c(
+  "Arsenal" = 11, "Aston Villa" = 405, "Atalanta" = 800, "Atleti" = 13, 
+  "B. Dortmund" = 16, "Barcelona" = 131, "Bayern München" = 27, "Benfica" = 294, 
+  "Bologna" = 1025, "Brest" = 3911, "Celtic" = 371, "Club Brugge" = 2282, 
+  "Crvena Zvezda" = 159, "Feyenoord" = 234, "Girona" = 12321, "GNK Dinamo" = 419, 
+  "Inter" = 46, "Juventus" = 506, "Leipzig" = 23826, "Leverkusen" = 15, 
+  "Lille" = 1082, "Liverpool" = 31, "Man City" = 281, "Milan" = 1, "Monaco" = 162, 
+  "Paris" = 583, "PSV" = 383, "Real Madrid" = 418, "S. Bratislava" = 540, 
+  "Salzburg" = 409, "Shakhtar" = 660, "Sparta Praha" = 197, "Sporting CP" = 336, 
+  "Sturm Graz" = 122, "Stuttgart" = 79, "Young Boys" = 452
+)
+
+```
+
+```{r}
+
+# Add team IDs to the badges data
+team_badges$team_id <- as.integer(team_ids[team_badges$Team_Name])
+
+# Define image save path
+save_dir <- "inputs/images/"
+
+# Check if the folder is not empty
+if (length(list.files(save_dir)) == 0) {
+  # Download images if the folder is empty
+  for (i in 1:nrow(team_badges)) {
+    download.file(team_badges$Logo_URL[i], file.path(save_dir, paste0(team_badges$team_id[i], ".png")))
+  }
+}
+
+# Add a "Badge" column to the dataset by appending ".png" to the "ID" column,
+# it will be used to visualize team logos later
+
+teams_table <- teams_table %>%
+  mutate(Badge = file.path(save_dir, paste0(ID, ".png")))
+
+
+```
+
+
+### 5. Analysis of team transactions and performance
+
+#### 5.1 Transactions by teams per season 
+
+The plot compares the total player investments of the top 12 teams in the Champions League from 2014 onward. Each team’s spending is shown in separate plots with a dynamic y-axis, emphasizing the significant disparity in investments. Some teams consistently spend large amounts, while others show much lower or more fluctuating spending patterns.
+
+```{r}
+
+# Filter the top 12 teams with the highest elo
+team_purchases_summary <- teams_table %>%
+  arrange(desc(avg_elo)) %>%  
+  distinct(Team, .keep_all = TRUE) %>%  
+  head(12) 
+
+# Filter data from 2014 onward
+team_purchases_series_top_12 <- teams_table %>%
+  filter(Team %in% team_purchases_summary$Team & year >= 2014)
+
+# Get the max value of Purchases and round it to the nearest multiple of 100
+max_purchase <- max(team_purchases_series_top_12$Purchases, na.rm = TRUE)
+y_max <- ceiling(max_purchase / 100) * 100  
+
+
+top_teams <- ggplot(team_purchases_series_top_12, aes(x = year, y = Purchases)) +
+  geom_line(color = "grey", size = 0.5) + 
+  geom_point(size = 0.001, color = "black") +  
+  labs(
+    title = "Investment in Players per Season by the Top 12 Teams in the Champions League",
+    y = "Total Purchases (in Euros)",
+    x = "Season"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 10, face = "bold"),
+    axis.text = element_text(size = 7),
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    panel.grid.major.y = element_line(color = "gray85", size = 0.5, linetype = "dashed"),
+    panel.grid.major.x = element_line(color = "gray85", size = 0.5, linetype = "dashed"),
+    panel.grid.minor = element_blank(),
+  ) +
+  ggimage::geom_image(
+    aes(x = year, y = Purchases, image = Badge),  
+    size = 0.10,  
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ Team) +  # Create individual plots for each team
+  scale_x_continuous(breaks = seq(min(team_purchases_series_top_12$year), 
+                                  max(team_purchases_series_top_12$year), by = 2)) +  
+  scale_y_continuous(limits = c(0, y_max), breaks = seq(0, y_max, by = 100)) 
+
+
+top_teams 
+ggsave("outputs/top_teams.jpg", plot = top_teams )
+
+```
+
+#### 5.2 Delving into the relationship between transactions and team perfomance 
+
+Scatter plots below show how purchases, financial balance, and cumulative purchases correlate with each team's average ELO rating.
+
+```{r}
+
+# First, I configured the common settings for the graphs. 
+
+plot_theme <-  
+  theme_minimal() +
+  theme(
+    legend.position = NULL,
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5)  
+  )
+
+
+# ELO vs log(purchases) Graph 
+
+scatter_1 <- ggplot(teams_table, aes(x = avg_elo, y = log_purchases)) +
+  geom_point(size = 2, color = "#8FBAC8") +
+   scale_y_continuous(
+        limits = c(9, 21),
+        breaks = seq(9, 21, by = 2)) +
+     scale_x_continuous(
+        limits = c(1300, 2100),
+        breaks = seq(1300, 2100, by = 300)) +
+  geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE) +
+  labs(
+    title = "Purchases vs. Average ELO",
+    x = "Average ELO",
+    y = "Log of Purchases"
+  ) +
+plot_theme
+
+scatter_1
+ggsave("outputs/scatter_1.jpg", plot = scatter_1)
+
+```
+
+```{r}
+
+# ELO vs log(cumulative_purchases) Graph 
+# I filtered for total_purchases greater than one to enhance the readability of the graph.
+
+scatter_2 <- ggplot(teams_table %>% filter(total_purchases > 1), aes(x = avg_elo, y = log(total_purchases * 1000000))) +
+  geom_point(size = 2, color = "#AFAE9B") + 
+  scale_y_continuous(
+    limits = c(13, 22),
+    breaks = seq(13, 22, by = 1.5)) +
+  scale_x_continuous(
+    limits = c(1300, 2100),
+    breaks = seq(1300, 2100, by = 300)) +
+   geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE) +
+  labs(
+    title = "Log of Cumulative purchases vs. Average ELO",
+    x = "Average ELO",
+    y = "Log of cumulative purchases"
+  ) +
+plot_theme
+
+scatter_2
+ggsave("outputs/scatter_2.jpg", plot = scatter_2)
+
+```
+
+```{r}
+
+# ELO vs Balance Graph 
+
+scatter_3 <- ggplot(teams_table, aes(x = avg_elo, y = Balance)) +
+  geom_point(size = 2, color = "#D2B9A3") +
+     scale_x_continuous(
+        limits = c(1300, 2100),
+        breaks = seq(1300, 2100, by = 300)) +
+   geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE) +
+  labs(
+    title = "Balance vs. Average ELO",
+    x = "Average ELO",
+    y = "Balance in Millions of Euros"
+  ) +
+plot_theme
+
+scatter_3
+ggsave("outputs/scatter_3.jpg", plot = scatter_3)
+
+```
+
+Player purchases in the season and historical purchases are positively correlated with performance, while transfer financial balance shows no clear correlation.
+
+#### 5.3 Calculate correlations between purchases and change in ELO
+
+A heatmap was created to examine the correlation between the annual change in ELO and the logarithm of player purchases, including the current season and the first three lags. This analysis reveals patterns in team performance and player acquisitions.
+
+```{r}
+
+# Create a dataset with the correlations between purchases and the change of elo 
+
+correlations <- teams_table %>%
+  arrange(Team, year) %>%  
+  group_by(Team) %>% 
+  summarise(
+    Purchases_t0 = cor(avg_elo, log_purchases, use = "complete.obs"),
+    Purchases_t1 = cor(avg_elo, lag(log_purchases, 1), use = "complete.obs"),
+    Purchases_t2 = cor(avg_elo, lag(log_purchases, 2), use = "complete.obs"),
+    Purchases_t3 = cor(avg_elo, lag(log_purchases, 3), use = "complete.obs"),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = starts_with("Purchases_"), 
+    names_to = "Lag", 
+    values_to = "Correlation"
+  ) 
+
+write.csv(correlations, "outputs/correlations.csv", row.names = FALSE)
+write.table(correlations, "outputs/correlations.txt", sep = "\t", row.names = FALSE, quote = FALSE, fileEncoding = "UTF-8")
+
+```
+
+
+```{r}
+
+#Heatmap Plot 
+
+heatmap <- ggplot(correlations, aes(x = Lag, y = Team, fill = Correlation)) +
+  geom_tile(color = "gray") +
+  scale_fill_gradient(low="white", high="blue") +
+  theme_minimal() +
+  theme(
+    plot.caption = element_text(hjust = 0, face = "italic", size = 6), 
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5)  
+  ) +
+  labs(
+    title = "Heatmap Elo - Purchases Correletions",
+    x = NULL,
+    y = NULL,
+    fill = "Correlation",
+    caption = "Correlation between a team's annual ELO change and the logarithm of player purchases over the current and past three seasons."
+  )
+
+heatmap
+ggsave("outputs/heatmap.jpg", plot = heatmap)
+
+```
+
+This heat-map shows that the correlation between purchases and performance varies widely among teams. For example, Manchester City and Leipzig show a strong correlation, while Celtic and Barcelona do not. This may indicates that other factors, such as playing style, youth player strength, or the quality of new signings, may need to be considered.
+
+### 6.Data Management and Reproducibility
+
+Data used in this report, including team transactions and Elo ratings, are stored in both CSV and Txt files for easy access and reproducibility. Generated outputs, like plots are saved as PNG files. A hierarchical folder structure is used to organize inputs and outputs, ensuring that the data can be easily accessed and reproduced.
+
+
+```{r}
+
+rmd_file <- "MY472-AT24-final-report.Rmd"
+
+read_file(rmd_file) %>% # read the file as a text file
+  str_squish() %>% # remove all extra white space
+  str_replace("^.+?output.+?[-]{3}", "") %>% # remove header
+  str_replace_all("``` *[{].+?```", " ") %>% # remove code chunks
+  str_replace_all("<![-].+?-->", " ") %>% # remove rmd comments
+  str_replace_all("[!]?\\[.+?\\][(].+?[)]", " ") %>% # remove links
+  str_replace_all("(^|\\s+)[^A-Za-z0-9]+", " ") %>% # remove symbols (1)
+  str_replace_all("[^A-Za-z0-9]+($|\\s+)", " ") %>% # remove symbols (2)
+  str_count("\\S+") %>% 
+  paste("The document is", ., "words.") %>%
+  print()
+
+
+
+```
+
+
